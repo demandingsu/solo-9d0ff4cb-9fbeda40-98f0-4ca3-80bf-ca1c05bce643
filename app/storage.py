@@ -13,7 +13,9 @@ committed in SQLite. A half-written file never appears in a snapshot.
 """
 from __future__ import annotations
 
+import logging
 import os
+import sqlite3
 import threading
 import time
 from dataclasses import dataclass
@@ -25,6 +27,9 @@ import pyarrow.parquet as pq
 
 from . import db
 from .config import Settings, settings
+from .errors import DataMigrationError
+
+logger = logging.getLogger("app.storage")
 
 
 @dataclass(frozen=True)
@@ -216,14 +221,117 @@ class FileManager:
             self._reaper_thread = None
 
     # -------------------------------------------------------------- recovery
+    def relocate_registered_files(self, cfg: Settings | None = None) -> dict:
+        """Rewrite absolute metadata paths after ``RAIN_DATA_DIR`` moves.
+
+        The engineer moves the whole data directory and points
+        ``RAIN_DATA_DIR`` at the new location. SQLite still stores the old
+        absolute ``file_path`` values, which would make :meth:`startup_sweep`
+        classify the moved, still-published files as orphans and delete them.
+
+        Rules (all-or-nothing, safe to re-run after a crash):
+
+        * only rows whose registered path is missing or rooted outside the
+          current ``parquet_root`` are considered for relocation; a database
+          already matching the current directory is a no-op;
+        * every *not yet reaped* row must have a complete, same-size file at
+          the canonical new location ``parquet/<station>/<day>/<batch>.parquet``
+          before any metadata is rewritten;
+        * rows of already reaped historical batches need no on-disk file and
+          never block a relocation -- their paths are simply rewritten;
+        * on any mismatch nothing is deleted and no metadata is changed: a
+          :class:`DataMigrationError` is raised so the process fails fast
+          instead of exposing a partially queryable dataset;
+        * the rewrite happens in one transaction, so an interrupted restart
+          simply repeats the whole check on the next boot.
+        """
+        cfg = cfg or self.cfg
+        parquet_root = cfg.parquet_root.resolve()
+        moved_rows: list[tuple[sqlite3.Row, Path]] = []
+
+        conn = db.connect()
+        try:
+            rows = conn.execute(
+                "SELECT batch_id, station_id, day, file_path, row_count, "
+                "size_bytes, reaped FROM batches ORDER BY rowid ASC"
+            ).fetchall()
+        finally:
+            conn.close()
+
+        missing: list[str] = []
+        size_mismatch: list[str] = []
+        for row in rows:
+            registered = Path(row["file_path"])
+            try:
+                in_current_root = registered.resolve().is_relative_to(parquet_root)
+            except (OSError, ValueError):
+                in_current_root = False
+            if in_current_root:
+                # Already stored with a path inside the active directory.
+                continue
+
+            target = self.target_path(row["station_id"], row["day"], row["batch_id"])
+            moved_rows.append((row, target))
+            if row["reaped"]:
+                # Historical batch whose file was intentionally removed long
+                # ago: nothing to verify, it must not block the relocation.
+                continue
+            if not target.is_file():
+                if str(registered.resolve()) == str(target.resolve()):
+                    missing.append(f"{row['batch_id']} -> {target}")
+                else:
+                    missing.append(
+                        f"{row['batch_id']} expected at {target} "
+                        f"(metadata still points at {registered})"
+                    )
+                continue
+            actual_size = target.stat().st_size
+            if actual_size != row["size_bytes"]:
+                size_mismatch.append(
+                    f"{row['batch_id']}: metadata size={row['size_bytes']} "
+                    f"actual size={actual_size} at {target}"
+                )
+
+        problems = missing + size_mismatch
+        if problems:
+            detail = "; ".join(problems[:10])
+            if len(problems) > 10:
+                detail += f"; ... and {len(problems) - 10} more"
+            raise DataMigrationError(
+                "RAIN_DATA_DIR relocation incomplete: "
+                f"{len(missing)} missing, {len(size_mismatch)} size-mismatched "
+                f"registered file(s); no metadata changed and no file deleted. "
+                f"Details: {detail}"
+            )
+
+        updates = [
+            (str(target), row["batch_id"]) for row, target in moved_rows
+        ]
+        if not updates:
+            return {"relocated": 0, "batch_ids": []}
+
+        with db.transaction() as tx:
+            tx.executemany(
+                "UPDATE batches SET file_path = ? WHERE batch_id = ?", updates
+            )
+        logger.info("relocated %d batch file path(s) to %s", len(updates), parquet_root)
+        return {
+            "relocated": len(updates),
+            "batch_ids": [row["batch_id"] for row, _ in moved_rows],
+        }
+
     def startup_sweep(self) -> dict[str, list[str]]:
         """Clean leftovers from a previous process.
 
-        * temp files from a crashed upload/merge are removed (never published,
-          therefore never queryable);
-        * Parquet files without a metadata row are removed (half-finished
-          output of a crashed merge);
-        * stale merge locks are released.
+        Order matters after a data-directory move:
+
+        1. remove crashed-upload/merge temp files (never published);
+        2. **relocate registered paths to the current root and verify the move
+           is complete** -- done before any Parquet deletion so files copied to
+           the new location are never mistaken for orphans;
+        3. only now remove Parquet files without a metadata row (genuine
+           half-finished output of a crashed merge);
+        4. release stale merge locks.
         """
         removed_tmp: list[str] = []
         removed_orphans: list[str] = []
@@ -232,6 +340,10 @@ class FileManager:
             for tmp in self.tmp_dir.glob("*.tmp-*"):
                 tmp.unlink(missing_ok=True)
                 removed_tmp.append(str(tmp))
+
+        # Fail fast on an incomplete relocation: no orphan sweep runs, so the
+        # existing files and every metadata row stay untouched.
+        relocation = self.relocate_registered_files()
 
         conn = db.connect()
         try:
@@ -251,7 +363,11 @@ class FileManager:
         with db.transaction() as tx:
             tx.execute("DELETE FROM merge_locks")
 
-        return {"temp_files": removed_tmp, "orphan_parquet": removed_orphans}
+        return {
+            "temp_files": removed_tmp,
+            "orphan_parquet": removed_orphans,
+            "relocated": relocation["batch_ids"],
+        }
 
 
 file_manager = FileManager()

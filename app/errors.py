@@ -26,3 +26,14 @@ class MergeFailedError(StorageError):
 
 class NotFoundError(StorageError):
     status_code = 404
+
+
+class DataMigrationError(StorageError):
+    """Registered files do not fully exist under the new data directory.
+
+    Raised at startup when ``RAIN_DATA_DIR`` was changed but the on-disk move
+    is incomplete. The process refuses to start so that no half-queryable
+    state is exposed and no file is deleted before metadata is rewritten.
+    """
+
+    status_code = 500

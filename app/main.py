@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 from typing import List, Optional
 
 from fastapi import FastAPI, File, HTTPException, Path as PathParam, Query, UploadFile
@@ -11,6 +12,8 @@ from . import db, services
 from .config import settings
 from .errors import StorageError
 from .storage import file_manager
+
+logger = logging.getLogger("app.main")
 
 
 # ----------------------------------------------------------------- schemas
@@ -79,7 +82,14 @@ async def lifespan(app: FastAPI):
     settings.parquet_root.mkdir(parents=True, exist_ok=True)
     settings.tmp_dir.mkdir(parents=True, exist_ok=True)
     db.init_db()
-    file_manager.startup_sweep()
+    try:
+        # Relocates stale absolute paths from an older RAIN_DATA_DIR before
+        # the orphan sweep runs. An incomplete move raises and aborts startup,
+        # so no file is deleted and no half-queryable service is exposed.
+        file_manager.startup_sweep()
+    except Exception:
+        logger.exception("startup storage sweep failed; refusing to start")
+        raise
     file_manager.start_reaper()
     yield
     file_manager.stop_reaper()
